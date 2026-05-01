@@ -185,10 +185,15 @@ export default function App() {
   const [success, setSuccess] = useState(false);
   const dbRef = useRef<IDBPDatabase | null>(null);
 
-  // Remove fallback shell on mount
+  // Safe Mount & Fallback Removal
   useEffect(() => {
     const fallback = document.getElementById('fallback-ui');
     if (fallback) fallback.classList.add('hidden');
+    
+    // Recovery: Clear potentially corrupted SW on boot if requested via URL or persistent crash
+    if (window.location.search.includes('reset=true') && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+    }
   }, []);
 
   // Online detection
@@ -202,30 +207,40 @@ export default function App() {
     };
   }, []);
 
-  // Initialize DB and load last session
+  // Safe DB Init
   useEffect(() => {
-    initDB().then(async (db) => {
-      dbRef.current = db;
-      const lastSession = await db.get(STORE_NAME, 'lastState');
-      if (lastSession) {
-        setOldJson(lastSession.oldJson || '');
-        setTemplateJson(lastSession.templateJson || '');
-        setOutputJson(lastSession.outputJson || '');
+    const setupDB = async () => {
+      try {
+        const db = await initDB();
+        dbRef.current = db;
+        const lastSession = await db.get(STORE_NAME, 'lastState');
+        if (lastSession) {
+          if (lastSession.oldJson) setOldJson(lastSession.oldJson);
+          if (lastSession.templateJson) setTemplateJson(lastSession.templateJson);
+        }
+      } catch (err) {
+        console.warn('Persistence unavailable, using in-memory mode', err);
       }
-    });
+    };
+    setupDB();
   }, []);
 
-  // Persist session
+  // Safe Session Persistence
   useEffect(() => {
     if (dbRef.current) {
-      dbRef.current.put(STORE_NAME, { oldJson, templateJson, outputJson }, 'lastState');
+      try {
+        dbRef.current.put(STORE_NAME, { oldJson, templateJson, outputJson }, 'lastState').catch(() => {});
+      } catch (e) {
+        // Silent fail for quota/incognito
+      }
     }
   }, [oldJson, templateJson, outputJson]);
 
   const isValidJson = (str: string) => {
-    if (!str.trim()) return false;
+    const trimmed = str.trim();
+    if (!trimmed) return false;
     try {
-      JSON.parse(str);
+      JSON.parse(trimmed);
       return true;
     } catch {
       return false;
@@ -233,15 +248,20 @@ export default function App() {
   };
 
   const handleFileSelect = async (file: File, type: 'old' | 'template') => {
-    const text = await file.text();
-    if (type === 'old') setOldJson(text);
-    else setTemplateJson(text);
+    try {
+      const text = await file.text();
+      if (type === 'old') setOldJson(text);
+      else setTemplateJson(text);
+    } catch (e) {
+      setError('Failed to read file. Please try pasting.');
+    }
   };
 
   const convertJson = useCallback(async () => {
     if (!oldJson) return;
+    
     if (!isValidJson(oldJson)) {
-      setError('Source text is not valid JSON');
+      setError('Input is not valid JSON. Check for trailing commas or missing quotes.');
       return;
     }
     
@@ -251,46 +271,47 @@ export default function App() {
 
     try {
       if (isOnline) {
-        // AI Path
-        const prompt = templateJson 
-          ? `Map the data from the following Old JSON into the structure of the New Format Template. 
-             Old JSON: ${oldJson}
-             New Format Template: ${templateJson}
-             Return ONLY the mapped JSON object. No words, no markdown.`
-          : `Cleanup and prettify this JSON: ${oldJson}. Return ONLY the JSON object.`;
+        try {
+          const prompt = templateJson && isValidJson(templateJson)
+            ? `Map the data from the following Old JSON into the structure of the New Format Template. 
+               Old JSON: ${oldJson}
+               New Format Template: ${templateJson}
+               Return ONLY the mapped JSON object. No words, no markdown.`
+            : `Cleanup and prettify this JSON: ${oldJson}. Return ONLY the JSON object.`;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: prompt,
-        });
+          const response = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: prompt,
+          });
 
-        const cleanedText = response.text?.replace(/```json|```/g, '').trim() || '';
-        if (isValidJson(cleanedText)) {
-          setOutputJson(JSON.stringify(JSON.parse(cleanedText), null, 2));
-          setIsOutputOpen(true);
-          setSuccess(true);
-        } else {
-          throw new Error("AI output was invalid JSON. Falling back to local mapping.");
+          const cleanedText = response.text?.replace(/```json|```/g, '').trim() || '';
+          if (isValidJson(cleanedText)) {
+            setOutputJson(JSON.stringify(JSON.parse(cleanedText), null, 2));
+            setIsOutputOpen(true);
+            setSuccess(true);
+            return;
+          }
+        } catch (aiErr) {
+          console.warn('AI conversion failed, checking local fallback', aiErr);
         }
-      } else {
-        // Offline Path: Best-effort local mapping
-        const sourceData = JSON.parse(oldJson);
-        const templateData = templateJson && isValidJson(templateJson) ? JSON.parse(templateJson) : null;
-        
-        const result = Array.isArray(sourceData) 
-          ? sourceData.map(item => localMorph(item, templateData))
-          : localMorph(sourceData, templateData);
-
-        setOutputJson(JSON.stringify(result, null, 2));
-        setIsOutputOpen(true);
-        setSuccess(true);
       }
+
+      // Offline or AI Fallback Path
+      const sourceData = JSON.parse(oldJson);
+      const templateData = templateJson && isValidJson(templateJson) ? JSON.parse(templateJson) : null;
+      
+      const result = Array.isArray(sourceData) 
+        ? sourceData.map(item => localMorph(item, templateData))
+        : localMorph(sourceData, templateData);
+
+      setOutputJson(JSON.stringify(result, null, 2));
+      setIsOutputOpen(true);
+      setSuccess(true);
+      
     } catch (err: any) {
-      setError(err.message || 'Conversion failed');
-      // Final fallback if AI failed
-      if (isOnline && isValidJson(oldJson)) {
-        const sourceData = JSON.parse(oldJson);
-        setOutputJson(JSON.stringify(sourceData, null, 2));
+      setError('Conversion failed. Returning raw input.');
+      if (isValidJson(oldJson)) {
+        setOutputJson(JSON.stringify(JSON.parse(oldJson), null, 2));
         setIsOutputOpen(true);
       }
     } finally {
