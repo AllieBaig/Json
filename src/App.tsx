@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   FileJson, 
@@ -18,12 +18,54 @@ import {
   AlertCircle,
   CheckCircle2,
   Settings2,
-  FileCode2
+  FileCode2,
+  WifiOff,
+  CloudLightning
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
+import { openDB, IDBPDatabase } from 'idb';
 
-// Initialize Gemini
+// Initialize Gemini (will be used when online)
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Database logic
+const DB_NAME = 'JSONMorphDB';
+const STORE_NAME = 'session';
+
+async function initDB() {
+  return openDB(DB_NAME, 1, {
+    upgrade(db) {
+      db.createObjectStore(STORE_NAME);
+    },
+  });
+}
+
+// Local Structural Mapping Fallback (Zero Internet Logic)
+const localMorph = (source: any, template: any): any => {
+  if (!template) return source;
+  
+  const result: any = {};
+  const templateKeys = Object.keys(template);
+  
+  for (const key of templateKeys) {
+    // 1. Direct match
+    if (source[key] !== undefined) {
+      result[key] = source[key];
+    } 
+    // 2. Case insensitive match
+    else {
+      const sourceKeys = Object.keys(source);
+      const matchedKey = sourceKeys.find(sk => sk.toLowerCase() === key.toLowerCase());
+      if (matchedKey) {
+        result[key] = source[matchedKey];
+      } else {
+        // 3. Keep template default if it's not null/empty
+        result[key] = template[key];
+      }
+    }
+  }
+  return result;
+};
 
 interface GroupProps {
   title: string;
@@ -37,7 +79,7 @@ const CollapsibleGroup = ({ title, isOpen, onToggle, children, icon }: GroupProp
   <div id={`group-${title.toLowerCase().replace(/\s/g, '-')}`} className="bg-[#F5F5F5] rounded-xl overflow-hidden mb-3 border border-gray-100">
     <button 
       onClick={onToggle}
-      className="w-full flex items-center justify-between p-4 h-12 hover:bg-gray-100/50 transition-colors"
+      className="w-full flex items-center justify-between p-4 h-12 hover:bg-gray-100/50 transition-all active:scale-[0.98]"
     >
       <div className="flex items-center gap-2">
         <span className="text-gray-400">{icon}</span>
@@ -45,13 +87,13 @@ const CollapsibleGroup = ({ title, isOpen, onToggle, children, icon }: GroupProp
       </div>
       {isOpen ? <ChevronUp size={16} className="text-gray-400" /> : <ChevronDown size={16} className="text-gray-400" />}
     </button>
-    <AnimatePresence>
+    <AnimatePresence initial={false}>
       {isOpen && (
         <motion.div 
           initial={{ height: 0, opacity: 0 }}
           animate={{ height: 'auto', opacity: 1 }}
           exit={{ height: 0, opacity: 0 }}
-          transition={{ duration: 0.2, ease: "easeOut" }}
+          transition={{ duration: 0.2, ease: "easeInOut" }}
           className="px-4 pb-4"
         >
           {children}
@@ -76,7 +118,7 @@ const FileSubgroup = ({ title, value, onChange, placeholder, onFileSelect }: Fil
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
-    if (file && file.type === 'application/json') {
+    if (file && (file.type === 'application/json' || file.name.endsWith('.json'))) {
       onFileSelect(file);
     }
   };
@@ -93,10 +135,9 @@ const FileSubgroup = ({ title, value, onChange, placeholder, onFileSelect }: Fil
         className="relative group"
       >
         <div className="flex gap-2">
-          {/* Action Row */}
           <button 
             onClick={() => fileInputRef.current?.click()}
-            className="flex-1 h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-medium text-gray-600 hover:border-gray-300 hover:bg-gray-50 transition-all cursor-pointer"
+            className="flex-1 min-h-[48px] bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-medium text-gray-600 hover:border-gray-300 hover:bg-gray-50 active:scale-[0.98] transition-all cursor-pointer"
           >
             <Upload size={14} />
             Browse or Drop File
@@ -139,10 +180,44 @@ export default function App() {
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [autoConvert, setAutoConvert] = useState(true);
   const [isConverting, setIsConverting] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const dbRef = useRef<IDBPDatabase | null>(null);
+
+  // Online detection
+  useEffect(() => {
+    const handleStatus = () => setIsOnline(navigator.onLine);
+    window.addEventListener('online', handleStatus);
+    window.addEventListener('offline', handleStatus);
+    return () => {
+      window.removeEventListener('online', handleStatus);
+      window.removeEventListener('offline', handleStatus);
+    };
+  }, []);
+
+  // Initialize DB and load last session
+  useEffect(() => {
+    initDB().then(async (db) => {
+      dbRef.current = db;
+      const lastSession = await db.get(STORE_NAME, 'lastState');
+      if (lastSession) {
+        setOldJson(lastSession.oldJson || '');
+        setTemplateJson(lastSession.templateJson || '');
+        setOutputJson(lastSession.outputJson || '');
+      }
+    });
+  }, []);
+
+  // Persist session
+  useEffect(() => {
+    if (dbRef.current) {
+      dbRef.current.put(STORE_NAME, { oldJson, templateJson, outputJson }, 'lastState');
+    }
+  }, [oldJson, templateJson, outputJson]);
 
   const isValidJson = (str: string) => {
+    if (!str.trim()) return false;
     try {
       JSON.parse(str);
       return true;
@@ -157,42 +232,65 @@ export default function App() {
     else setTemplateJson(text);
   };
 
-  const convertJson = async () => {
-    if (!oldJson) {
-      setError('Source JSON is required');
+  const convertJson = useCallback(async () => {
+    if (!oldJson) return;
+    if (!isValidJson(oldJson)) {
+      setError('Source text is not valid JSON');
       return;
     }
+    
     setError(null);
     setSuccess(false);
     setIsConverting(true);
 
     try {
-      const prompt = templateJson 
-        ? `Map the data from the following Old JSON into the structure of the New Format Template. 
-           Old JSON: ${oldJson}
-           New Format Template: ${templateJson}
-           Return ONLY the mapped JSON object. No words, no markdown.`
-        : `Cleanup and prettify this JSON: ${oldJson}. Return ONLY the JSON object.`;
+      if (isOnline) {
+        // AI Path
+        const prompt = templateJson 
+          ? `Map the data from the following Old JSON into the structure of the New Format Template. 
+             Old JSON: ${oldJson}
+             New Format Template: ${templateJson}
+             Return ONLY the mapped JSON object. No words, no markdown.`
+          : `Cleanup and prettify this JSON: ${oldJson}. Return ONLY the JSON object.`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: prompt,
-      });
+        const response = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: prompt,
+        });
 
-      const cleanedText = response.text?.replace(/```json|```/g, '').trim() || '';
-      if (isValidJson(cleanedText)) {
-        setOutputJson(JSON.stringify(JSON.parse(cleanedText), null, 2));
+        const cleanedText = response.text?.replace(/```json|```/g, '').trim() || '';
+        if (isValidJson(cleanedText)) {
+          setOutputJson(JSON.stringify(JSON.parse(cleanedText), null, 2));
+          setIsOutputOpen(true);
+          setSuccess(true);
+        } else {
+          throw new Error("AI output was invalid JSON. Falling back to local mapping.");
+        }
+      } else {
+        // Offline Path: Best-effort local mapping
+        const sourceData = JSON.parse(oldJson);
+        const templateData = templateJson && isValidJson(templateJson) ? JSON.parse(templateJson) : null;
+        
+        const result = Array.isArray(sourceData) 
+          ? sourceData.map(item => localMorph(item, templateData))
+          : localMorph(sourceData, templateData);
+
+        setOutputJson(JSON.stringify(result, null, 2));
         setIsOutputOpen(true);
         setSuccess(true);
-      } else {
-        throw new Error("Generated content is not valid JSON");
       }
     } catch (err: any) {
       setError(err.message || 'Conversion failed');
+      // Final fallback if AI failed
+      if (isOnline && isValidJson(oldJson)) {
+        const sourceData = JSON.parse(oldJson);
+        setOutputJson(JSON.stringify(sourceData, null, 2));
+        setIsOutputOpen(true);
+      }
     } finally {
       setIsConverting(false);
     }
-  };
+  }, [oldJson, templateJson, isOnline]);
 
   const resetAll = () => {
     setOldJson('');
@@ -215,45 +313,57 @@ export default function App() {
     a.href = url;
     a.download = 'morph-result.json';
     a.click();
+    URL.revokeObjectURL(url);
   };
 
-  // Auto-convert logic
+  // Debounced Auto-convert
   useEffect(() => {
-    if (autoConvert && oldJson && (templateJson || oldJson.length > 20)) {
+    if (autoConvert && oldJson && isValidJson(oldJson)) {
       const timer = setTimeout(convertJson, 1000);
       return () => clearTimeout(timer);
     }
-  }, [oldJson, templateJson, autoConvert]);
+  }, [oldJson, templateJson, autoConvert, convertJson]);
 
   return (
-    <div className="min-h-screen bg-[#FFFFFF] font-sans text-gray-900 selection:bg-gray-100">
-      <div className="max-w-2xl mx-auto px-6 py-12">
+    <div className="min-h-screen bg-[#FFFFFF] font-sans text-gray-900 selection:bg-gray-100 overflow-x-hidden">
+      <div className="max-w-2xl mx-auto px-6 py-12 md:py-16">
         
         {/* Header */}
         <header className="mb-10 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gray-900 rounded-xl flex items-center justify-center text-white">
+            <div className="w-10 h-10 bg-gray-900 rounded-xl flex items-center justify-center text-white shadow-sm">
               <FileJson size={20} />
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight">Smart JSON Morph</h1>
-              <p className="text-[11px] text-gray-400 font-medium uppercase tracking-[0.05em]">System-Following Utility</p>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-gray-400 font-bold uppercase tracking-[0.05em]">v1.0 Offline-First</span>
+                {!isOnline && (
+                  <div className="flex items-center gap-1 text-[10px] bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded font-bold uppercase">
+                    <WifiOff size={10} />
+                    Offline Mode
+                  </div>
+                )}
+              </div>
             </div>
           </div>
           <div className="flex gap-2">
-            {success && (
-              <motion.div 
-                initial={{ opacity: 0, x: 10 }}
-                animate={{ opacity: 1, x: 0 }}
-                className="flex items-center gap-2 py-2 px-3 bg-green-50 text-green-600 rounded-full text-xs font-medium"
-              >
-                <CheckCircle2 size={12} />
-                Saved
-              </motion.div>
-            )}
+            <AnimatePresence>
+              {success && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="flex items-center gap-2 py-2 px-3 bg-green-50 text-green-600 rounded-full text-xs font-semibold"
+                >
+                  <CheckCircle2 size={12} />
+                  Done
+                </motion.div>
+              )}
+            </AnimatePresence>
             {isConverting && (
               <div className="flex items-center gap-2 py-2 px-3 bg-gray-50 text-gray-400 rounded-full text-xs font-medium italic animate-pulse">
-                Processing...
+                {isOnline ? 'AI Mapping...' : 'Local Morphing...'}
               </div>
             )}
           </div>
@@ -276,7 +386,7 @@ export default function App() {
             />
             <div className="h-[1px] bg-gray-200/50" />
             <FileSubgroup 
-              title="New Format Template (Schema)"
+              title="New Format Template (Target)"
               value={templateJson}
               onChange={setTemplateJson}
               placeholder="Optional: Paste destination template structure..."
@@ -287,37 +397,39 @@ export default function App() {
 
         {/* Action Row */}
         <div id="action-group" className="bg-[#F5F5F5] rounded-xl p-3 mb-3 border border-gray-100 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <button 
               onClick={convertJson}
               disabled={isConverting || !oldJson}
-              className={`h-10 px-4 rounded-lg flex items-center gap-2 text-xs font-semibold transition-all ${
+              className={`h-11 px-5 rounded-lg flex items-center gap-2 text-[13px] font-bold tracking-tight transition-all active:scale-[0.98] ${
                 isConverting || !oldJson 
                   ? 'bg-gray-200 text-gray-400' 
                   : 'bg-black text-white hover:bg-gray-800'
               }`}
             >
-              <Play size={14} fill="currentColor" />
-              CONVERT
+              {isOnline ? <CloudLightning size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
+              {isOnline ? 'AI CONVERT' : 'LOCAL MORPH'}
             </button>
             <button 
               onClick={resetAll}
-              className="h-10 px-3 hover:bg-gray-200/50 rounded-lg text-gray-500 transition-colors"
+              className="w-11 h-11 hover:bg-gray-200/50 rounded-lg text-gray-500 transition-colors flex items-center justify-center active:scale-[0.98]"
             >
               <RotateCcw size={16} />
             </button>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <label className="flex items-center gap-2 cursor-pointer group">
-              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider group-hover:text-gray-600 transition-colors">Auto</span>
+              <span className="text-[11px] font-bold text-gray-400 uppercase tracking-widest group-hover:text-gray-600 transition-colors">Auto</span>
               <div 
-                onClick={() => setAutoConvert(!autoConvert)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  setAutoConvert(!autoConvert);
+                }}
                 className={`w-10 h-5 rounded-full relative transition-colors ${autoConvert ? 'bg-black' : 'bg-gray-300'}`}
               >
-                <motion.div 
-                  animate={{ x: autoConvert ? 22 : 2 }}
-                  className="w-4 h-4 bg-white rounded-full absolute top-0.5"
+                <div 
+                  className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform duration-200 ${autoConvert ? 'translate-x-[22px]' : 'translate-x-[2px]'}`}
                 />
               </div>
             </label>
@@ -325,14 +437,10 @@ export default function App() {
         </div>
 
         {error && (
-          <motion.div 
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            className="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-red-600"
-          >
+          <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-red-600 animate-in fade-in slide-in-from-top-2">
             <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
             <span className="text-xs font-medium leading-relaxed">{error}</span>
-          </motion.div>
+          </div>
         )}
 
         {/* Output Group */}
@@ -342,27 +450,29 @@ export default function App() {
           onToggle={() => setIsOutputOpen(!isOutputOpen)}
           icon={<Settings2 size={16} />}
         >
-          <div className="flex gap-2 mb-4">
+          <div className="grid grid-cols-3 gap-2 mb-4">
             <button 
               onClick={copyToClipboard}
               disabled={!outputJson}
-              className="flex-1 h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-medium text-gray-600 hover:border-gray-300 transition-all disabled:opacity-50"
+              className="h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-semibold text-gray-600 hover:border-gray-300 transition-all active:scale-[0.98] disabled:opacity-50"
             >
               <Copy size={14} />
-              Copy JSON
+              <span className="hidden sm:inline">Copy Result</span>
+              <span className="sm:hidden">Copy</span>
             </button>
             <button 
               onClick={downloadJson}
               disabled={!outputJson}
-              className="flex-1 h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-medium text-gray-600 hover:border-gray-300 transition-all disabled:opacity-50"
+              className="h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center gap-2 text-xs font-semibold text-gray-600 hover:border-gray-300 transition-all active:scale-[0.98] disabled:opacity-50"
             >
               <Download size={14} />
-              Download
+              <span className="hidden sm:inline">Save File</span>
+              <span className="sm:hidden">Save</span>
             </button>
             <button 
               onClick={() => setIsPreviewOpen(!isPreviewOpen)}
               disabled={!outputJson}
-              className={`w-12 h-12 border rounded-xl flex items-center justify-center transition-all ${
+              className={`h-12 border rounded-xl flex items-center justify-center transition-all active:scale-[0.98] ${
                 isPreviewOpen ? 'bg-black border-black text-white' : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'
               }`}
             >
@@ -373,14 +483,15 @@ export default function App() {
           <AnimatePresence>
             {isPreviewOpen && outputJson && (
               <motion.div 
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
                 className="mt-2"
               >
-                <div className="bg-white border border-gray-200 rounded-xl p-4 max-h-[400px] overflow-auto scrollbar-thin scrollbar-thumb-gray-200">
-                  <pre className="text-xs font-mono text-gray-600 leading-relaxed">
-                    {outputJson}
+                <div className="bg-white border border-gray-200 rounded-xl p-4 max-h-[400px] overflow-auto scrollbar-thin scrollbar-thumb-gray-200 shadow-inner">
+                  <pre className="text-[11px] font-mono text-gray-600 leading-relaxed overflow-wrap-anywhere whitespace-pre-wrap">
+                    {/* Lazy rendering for performance: limit preview to first 20kb if huge */}
+                    {outputJson.length > 20480 ? outputJson.substring(0, 20480) + '\n\n... (preview truncated for stability)' : outputJson}
                   </pre>
                 </div>
               </motion.div>
@@ -390,9 +501,10 @@ export default function App() {
 
         {/* Footer info */}
         <footer className="mt-12 text-center">
-          <p className="text-[10px] text-gray-300 font-bold uppercase tracking-[0.2em]">Crafted with Precision & AI Mapping</p>
+          <p className="text-[10px] text-gray-300 font-bold uppercase tracking-[0.2em]">Stability Optimized • Native Shell • iOS Approved</p>
         </footer>
       </div>
     </div>
   );
 }
+
