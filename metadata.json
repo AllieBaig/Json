@@ -1,0 +1,6 @@
+{
+  "name": "Smart JSON Morph",
+  "description": "Minimal, high-performance JSON converter with smart mapping and nested file management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
