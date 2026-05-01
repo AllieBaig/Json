@@ -185,6 +185,12 @@ export default function App() {
   const [success, setSuccess] = useState(false);
   const dbRef = useRef<IDBPDatabase | null>(null);
 
+  // Remove fallback shell on mount
+  useEffect(() => {
+    const fallback = document.getElementById('fallback-ui');
+    if (fallback) fallback.classList.add('hidden');
+  }, []);
+
   // Online detection
   useEffect(() => {
     const handleStatus = () => setIsOnline(navigator.onLine);

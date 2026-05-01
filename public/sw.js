@@ -1,17 +1,15 @@
-const CACHE_NAME = 'json-morph-v1';
+const CACHE_NAME = 'json-morph-v2';
 const ASSETS_TO_CACHE = [
   '/',
   '/index.html',
-  '/manifest.json',
-  '/src/main.tsx',
-  '/src/App.tsx',
-  '/src/index.css'
+  '/manifest.json'
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS_TO_CACHE);
+      // Use a more lenient caching strategy for install to avoid failure
+      return cache.addAll(ASSETS_TO_CACHE).catch(err => console.log('Pre-cache failed', err));
     })
   );
   self.skipWaiting();
@@ -23,38 +21,40 @@ self.addEventListener('activate', (event) => {
       return Promise.all(
         cacheNames.map((cacheName) => {
           if (cacheName !== CACHE_NAME) {
+            console.log('Cleaning old cache:', cacheName);
             return caches.delete(cacheName);
           }
         })
       );
-    })
+    }).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
-  // Skip API calls
+  // Skip cross-origin or non-GET requests
+  if (event.request.method !== 'GET' || !event.request.url.startsWith(self.location.origin)) {
+    return;
+  }
+
+  // AI API bypass
   if (event.request.url.includes('generativelanguage.googleapis.com')) {
     return;
   }
 
   event.respondWith(
     caches.match(event.request).then((response) => {
-      return response || fetch(event.request).then((fetchResponse) => {
-        // Only cache valid responses from our origin
-        if (fetchResponse.ok && fetchResponse.type === 'basic') {
-          const responseToCache = fetchResponse.clone();
+      // Prioritize network for the latest assets, but fallback to cache fast
+      const fetchPromise = fetch(event.request).then((networkResponse) => {
+        if (networkResponse.ok && networkResponse.type === 'basic') {
+          const responseToCache = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => {
             cache.put(event.request, responseToCache);
           });
         }
-        return fetchResponse;
-      });
-    }).catch(() => {
-      // Offline fallback for navigation
-      if (event.request.mode === 'navigate') {
-        return caches.match('/');
-      }
+        return networkResponse;
+      }).catch(() => null);
+
+      return response || fetchPromise;
     })
   );
 });
